@@ -40,7 +40,7 @@ func applyOptions(opts []Option) options {
 }
 
 type KubeApplier interface {
-	ApplyResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force, validate, serverSideApply bool, manager string, serverSideDiff bool) (string, error)
+	ApplyResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force bool, validate bool, serverSideApply bool, manager string, serverSideDiff bool) (string, error)
 }
 
 // ServerSideDryRunner defines the contract to run a server-side apply in
