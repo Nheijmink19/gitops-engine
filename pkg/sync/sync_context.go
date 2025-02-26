@@ -336,6 +336,7 @@ type syncContext struct {
 	namespace           string
 
 	dryRun                 bool
+	skipDryRun             bool
 	force                  bool
 	validate               bool
 	skipHooks              bool
@@ -742,6 +743,10 @@ func (sc *syncContext) getSyncTasks() (_ syncTasks, successful bool) {
 			if serverRes != nil {
 				serverResCache[task.groupVersionKind()] = serverRes
 			}
+		}
+
+		if sc.skipDryRun {
+			task.skipDryRun = true
 		}
 
 		if err != nil {
