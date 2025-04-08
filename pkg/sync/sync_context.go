@@ -189,6 +189,12 @@ func WithReplace(replace bool) SyncOpt {
 	}
 }
 
+func WithSkipDryRun(skipDryRun bool) SyncOpt {
+	return func(ctx *syncContext) {
+		ctx.skipDryRun = skipDryRun
+	}
+}
+
 func WithServerSideApply(serverSideApply bool) SyncOpt {
 	return func(ctx *syncContext) {
 		ctx.serverSideApply = serverSideApply
