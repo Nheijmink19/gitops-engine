@@ -818,11 +818,10 @@ func (sc *syncContext) getSyncTasks() (_ syncTasks, successful bool) {
 			}
 		}
 
-		if sc.skipDryRun {
-			task.skipDryRun = true
-		}
-
 		if err != nil {
+			// Skip dryrun for task if the sync context is in no-dryrun mode
+			task.skipDryRun = sc.skipDryRun
+
 			// Special case for custom resources: if CRD is not yet known by the K8s API server,
 			// and the CRD is part of this sync or the resource is annotated with SkipDryRunOnMissingResource=true,
 			// then skip verification during `kubectl apply --dry-run` since we expect the CRD
