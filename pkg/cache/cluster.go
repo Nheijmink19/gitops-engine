@@ -12,9 +12,8 @@ import (
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/semaphore"
 	authorizationv1 "k8s.io/api/authorization/v1"
-	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -107,11 +106,13 @@ type OnEventHandler func(event watch.EventType, un *unstructured.Unstructured)
 type OnProcessEventsHandler func(duration time.Duration, processedEventsNumber int)
 
 // OnPopulateResourceInfoHandler returns additional resource metadata that should be stored in cache
-type OnPopulateResourceInfoHandler func(un *unstructured.Unstructured, isRoot bool) (info interface{}, cacheManifest bool)
+type OnPopulateResourceInfoHandler func(un *unstructured.Unstructured, isRoot bool) (info any, cacheManifest bool)
 
 // OnResourceUpdatedHandler handlers resource update event
-type OnResourceUpdatedHandler func(newRes *Resource, oldRes *Resource, namespaceResources map[kube.ResourceKey]*Resource)
-type Unsubscribe func()
+type (
+	OnResourceUpdatedHandler func(newRes *Resource, oldRes *Resource, namespaceResources map[kube.ResourceKey]*Resource)
+	Unsubscribe              func()
+)
 
 type ClusterCache interface {
 	// EnsureSynced checks cache state and synchronizes it if necessary
@@ -262,12 +263,12 @@ type clusterCacheSync struct {
 }
 
 // ListRetryFuncNever never retries on errors
-func ListRetryFuncNever(err error) bool {
+func ListRetryFuncNever(_ error) bool {
 	return false
 }
 
 // ListRetryFuncAlways always retries on errors
-func ListRetryFuncAlways(err error) bool {
+func ListRetryFuncAlways(_ error) bool {
 	return true
 }
 
@@ -332,6 +333,7 @@ func (c *clusterCache) OnProcessEventsHandler(handler OnProcessEventsHandler) Un
 		delete(c.processEventsHandlers, key)
 	}
 }
+
 func (c *clusterCache) getProcessEventsHandlers() []OnProcessEventsHandler {
 	c.handlersLock.Lock()
 	defer c.handlersLock.Unlock()
@@ -420,7 +422,7 @@ func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
 	ownerRefs, isInferredParentOf := c.resolveResourceReferences(un)
 
 	cacheManifest := false
-	var info interface{}
+	var info any
 	if c.populateResourceInfoHandler != nil {
 		info, cacheManifest = c.populateResourceInfoHandler(un, len(ownerRefs) == 0)
 	}
@@ -559,7 +561,6 @@ func (c *clusterCache) startMissingWatches() error {
 						delete(namespacedResources, api.GroupKind)
 						return nil
 					}
-
 				}
 				go c.watchEvents(ctx, api, resClient, ns, resourceVersion)
 				return nil
@@ -587,7 +588,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 	}
 	defer c.listSemaphore.Release(1)
 
-	var retryCount int64 = 0
+	var retryCount int64
 	resourceVersion := ""
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		var res *unstructured.UnstructuredList
@@ -606,7 +607,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 			if ierr != nil {
 				// Log out a retry
 				if c.listRetryLimit > 1 && c.listRetryFunc(ierr) {
-					retryCount += 1
+					retryCount++
 					c.log.Info(fmt.Sprintf("Error while listing resources: %v (try %d/%d)", ierr, retryCount, c.listRetryLimit))
 				}
 				return ierr
@@ -635,7 +636,6 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 			return nil
 		})
 	})
-
 	if err != nil {
 		return "", fmt.Errorf("failed to load initial state of resource %s: %w", api.GroupKind.String(), err)
 	}
@@ -645,10 +645,9 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 			c.replaceResourceCache(api.GroupKind, items, ns)
 			return nil
 		})
-	} else {
-		c.replaceResourceCache(api.GroupKind, items, ns)
-		return resourceVersion, nil
 	}
+	c.replaceResourceCache(api.GroupKind, items, ns)
+	return resourceVersion, nil
 }
 
 func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo, resClient dynamic.ResourceInterface, ns string, resourceVersion string) {
@@ -670,7 +669,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 		w, err := watchutil.NewRetryWatcher(resourceVersion, &cache.ListWatch{
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				res, err := resClient.Watch(ctx, options)
-				if errors.IsNotFound(err) {
+				if apierrors.IsNotFound(err) {
 					c.stopWatching(api.GroupKind, ns)
 				}
 				return res, err
@@ -719,7 +718,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 				c.recordEvent(event.Type, obj)
 				if kube.IsCRD(obj) {
 					var resources []kube.APIResourceInfo
-					crd := v1.CustomResourceDefinition{}
+					crd := apiextensionsv1.CustomResourceDefinition{}
 					err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &crd)
 					if err != nil {
 						c.log.Error(err, "Failed to extract CRD resources")
@@ -727,13 +726,15 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 					for _, v := range crd.Spec.Versions {
 						resources = append(resources, kube.APIResourceInfo{
 							GroupKind: schema.GroupKind{
-								Group: crd.Spec.Group, Kind: crd.Spec.Names.Kind},
+								Group: crd.Spec.Group, Kind: crd.Spec.Names.Kind,
+							},
 							GroupVersionResource: schema.GroupVersionResource{
-								Group: crd.Spec.Group, Version: v.Name, Resource: crd.Spec.Names.Plural},
+								Group: crd.Spec.Group, Version: v.Name, Resource: crd.Spec.Names.Plural,
+							},
 							Meta: metav1.APIResource{
 								Group:        crd.Spec.Group,
 								SingularName: crd.Spec.Names.Singular,
-								Namespaced:   crd.Spec.Scope == v1.NamespaceScoped,
+								Namespaced:   crd.Spec.Scope == apiextensionsv1.NamespaceScoped,
 								Name:         crd.Spec.Names.Plural,
 								Kind:         crd.Spec.Names.Singular,
 								Version:      v.Name,
@@ -805,7 +806,7 @@ func (c *clusterCache) processApi(client dynamic.Interface, api kube.APIResource
 
 // isRestrictedResource checks if the kube api call is unauthorized or forbidden
 func (c *clusterCache) isRestrictedResource(err error) bool {
-	return c.respectRBAC != RespectRbacDisabled && (k8sErrors.IsForbidden(err) || k8sErrors.IsUnauthorized(err))
+	return c.respectRBAC != RespectRbacDisabled && (apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err))
 }
 
 // checkPermission runs a self subject access review to check if the controller has permissions to list the resource
@@ -842,10 +843,10 @@ func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface auth
 			}
 			if resp != nil && resp.Status.Allowed {
 				return true, nil
-			} else {
-				// unsupported, remove from watch list
-				return false, nil
 			}
+			// unsupported, remove from watch list
+			//nolint:staticcheck //FIXME
+			return false, nil
 		}
 	}
 	// checkPermission follows the same logic of determining namespace/cluster resource as the processApi function
@@ -881,7 +882,6 @@ func (c *clusterCache) sync() error {
 	c.namespacedResources = make(map[schema.GroupKind]bool)
 	config := c.config
 	version, err := c.kubectl.GetServerVersion(config)
-
 	if err != nil {
 		return err
 	}
@@ -904,7 +904,6 @@ func (c *clusterCache) sync() error {
 	c.openAPISchema = openAPISchema
 
 	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
-
 	if err != nil {
 		return err
 	}
@@ -974,10 +973,9 @@ func (c *clusterCache) sync() error {
 			return nil
 		})
 	})
-
 	if err != nil {
 		c.log.Error(err, "Failed to sync cluster")
-		return fmt.Errorf("failed to sync cluster %s: %v", c.config.Host, err)
+		return fmt.Errorf("failed to sync cluster %s: %w", c.config.Host, err)
 	}
 
 	c.log.Info("Cluster successfully synced")
@@ -1157,13 +1155,12 @@ func buildGraph(nsNodes map[kube.ResourceKey]*Resource) map[kube.ResourceKey]map
 					continue
 				}
 				graphKeyNode, ok := nsNodes[kube.ResourceKey{Group: group.Group, Kind: ownerRef.Kind, Namespace: childNode.Ref.Namespace, Name: ownerRef.Name}]
-				if ok {
-					ownerRef.UID = graphKeyNode.Ref.UID
-					childNode.OwnerRefs[i] = ownerRef
-				} else {
+				if !ok {
 					// No resource found with the given graph key, so move on.
 					continue
 				}
+				ownerRef.UID = graphKeyNode.Ref.UID
+				childNode.OwnerRefs[i] = ownerRef
 			}
 
 			// Now that we have the UID of the parent, update the graph.
@@ -1198,7 +1195,7 @@ func (c *clusterCache) IsNamespaced(gk schema.GroupKind) (bool, error) {
 	if isNamespaced, ok := c.namespacedResources[gk]; ok {
 		return isNamespaced, nil
 	}
-	return false, errors.NewNotFound(schema.GroupResource{Group: gk.Group}, "")
+	return false, apierrors.NewNotFound(schema.GroupResource{Group: gk.Group}, "")
 }
 
 func (c *clusterCache) managesNamespace(namespace string) bool {
@@ -1251,7 +1248,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 					var err error
 					managedObj, err = c.kubectl.GetResource(context.TODO(), c.config, targetObj.GroupVersionKind(), existingObj.Ref.Name, existingObj.Ref.Namespace)
 					if err != nil {
-						if errors.IsNotFound(err) {
+						if apierrors.IsNotFound(err) {
 							return nil
 						}
 						return err
@@ -1261,7 +1258,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 				var err error
 				managedObj, err = c.kubectl.GetResource(context.TODO(), c.config, targetObj.GroupVersionKind(), targetObj.GetName(), targetObj.GetNamespace())
 				if err != nil {
-					if errors.IsNotFound(err) {
+					if apierrors.IsNotFound(err) {
 						return nil
 					}
 					return err
@@ -1276,7 +1273,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 				c.log.V(1).Info(fmt.Sprintf("Failed to convert resource: %v", err))
 				managedObj, err = c.kubectl.GetResource(context.TODO(), c.config, targetObj.GroupVersionKind(), managedObj.GetName(), managedObj.GetNamespace())
 				if err != nil {
-					if errors.IsNotFound(err) {
+					if apierrors.IsNotFound(err) {
 						return nil
 					}
 					return err
@@ -1409,11 +1406,9 @@ func (c *clusterCache) onNodeRemoved(key kube.ResourceKey) {
 	}
 }
 
-var (
-	ignoredRefreshResources = map[string]bool{
-		"/" + kube.EndpointsKind: true,
-	}
-)
+var ignoredRefreshResources = map[string]bool{
+	"/" + kube.EndpointsKind: true,
+}
 
 // GetClusterInfo returns cluster cache statistics
 func (c *clusterCache) GetClusterInfo() ClusterInfo {
